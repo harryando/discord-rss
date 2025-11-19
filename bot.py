@@ -1,12 +1,20 @@
+# Discord RSS V1.1
+
+import asyncio
+import threading
 import logging
 import sqlite3
+import os
 from datetime import datetime, timedelta, timezone
+from logging.handlers import TimedRotatingFileHandler
 
 import discord
 from discord.ext import commands, tasks
 import feedparser
 
 from config import TOKEN, CHANNEL_ID, UPDATE_INTERVAL, LAST_ARTICLE_RANGE, RSS_FEEDS
+
+__version__ = "1.1"
 
 KEYWORDS = [
     "akuisisi",
@@ -19,14 +27,34 @@ KEYWORDS = [
     "pcar",
 ]
 
-
-
 # -------------------------------------------------------
-# Logging sederhana
+# Setup Logging: console + file harian di folder logs/
 # -------------------------------------------------------
+LOG_DIR = "logs"
+os.makedirs(LOG_DIR, exist_ok=True)
+
+# File dasar log (akan di-rotate harian)
+# Rotated file akan menjadi: logs/logs_19-11-2025.txt, logs/logs_20-11-2025.txt, dst.
+log_base_path = os.path.join(LOG_DIR, "logs")
+
+file_handler = TimedRotatingFileHandler(
+    log_base_path,
+    when="midnight",
+    interval=1,
+    backupCount=30,      # simpan 30 hari log, bisa diubah
+    encoding="utf-8",
+)
+
+# Format nama file setelah di-rotate:
+# logs/logs_19-11-2025.txt
+file_handler.suffix = "_%d-%m-%Y.txt"
+
+console_handler = logging.StreamHandler()
+
 logging.basicConfig(
     level=logging.INFO,
     format="[%(asctime)s] [%(levelname)s] %(message)s",
+    handlers=[console_handler, file_handler],
 )
 
 # -------------------------------------------------------
@@ -34,8 +62,10 @@ logging.basicConfig(
 # -------------------------------------------------------
 DB_PATH = "articles.db"
 
-conn = sqlite3.connect(DB_PATH)
+# check_same_thread=False agar bisa dipakai dari thread lain (to_thread)
+conn = sqlite3.connect(DB_PATH, check_same_thread=False)
 cur = conn.cursor()
+DB_LOCK = threading.Lock()
 
 # Simpan link sebagai PRIMARY KEY supaya tidak ada duplikat
 cur.execute(
@@ -48,21 +78,21 @@ cur.execute(
 )
 conn.commit()
 
-
 def article_already_sent(link: str) -> bool:
     """Cek apakah link artikel sudah pernah disimpan di DB."""
-    cur.execute("SELECT 1 FROM articles WHERE link = ?", (link,))
-    return cur.fetchone() is not None
-
+    with DB_LOCK:
+        cur.execute("SELECT 1 FROM articles WHERE link = ?", (link,))
+        return cur.fetchone() is not None
 
 def save_article(link: str, title: str) -> None:
     """Simpan artikel ke DB setelah pesan sukses dikirim."""
     try:
-        cur.execute(
-            "INSERT OR IGNORE INTO articles (link, title) VALUES (?, ?)",
-            (link, title),
-        )
-        conn.commit()
+        with DB_LOCK:
+            cur.execute(
+                "INSERT OR IGNORE INTO articles (link, title) VALUES (?, ?)",
+                (link, title),
+            )
+            conn.commit()
     except Exception as e:
         logging.error("Gagal menyimpan artikel ke DB: %s", e)
 
@@ -70,6 +100,7 @@ def title_has_keyword(title: str) -> bool:
     """Cek apakah judul mengandung salah satu keyword."""
     lower_title = title.lower()
     return any(keyword in lower_title for keyword in KEYWORDS)
+
 
 # -------------------------------------------------------
 # Fungsi bantu untuk parsing tanggal dari RSS
@@ -80,13 +111,9 @@ def get_entry_datetime(entry) -> datetime | None:
     Coba pakai published_parsed kalau ada,
     kalau tidak ada ya kembalikan None (anggap tanpa batas tanggal).
     """
-    # feedparser biasanya punya published_parsed (time.struct_time)
     if hasattr(entry, "published_parsed") and entry.published_parsed:
-        # published_parsed → datetime dengan timezone UTC
         return datetime(*entry.published_parsed[:6], tzinfo=timezone.utc)
 
-    # fallback: kalau hanya ada string, bisa coba di-parse manual sesuai format feed
-    # Di banyak RSS classic: "Mon, 01 Jan 2024 12:34:56 +0000"
     if hasattr(entry, "published"):
         try:
             return datetime.strptime(
@@ -94,14 +121,13 @@ def get_entry_datetime(entry) -> datetime | None:
                 "%a, %d %b %Y %H:%M:%S %z",
             ).astimezone(timezone.utc)
         except Exception:
-            # kalau gagal parse, kita abaikan batas umur artikel
             return None
 
     return None
 
 
 # -------------------------------------------------------
-# Ambil artikel baru dari semua RSS_FEDS
+# Ambil artikel baru dari semua RSS_FEEDS
 # -------------------------------------------------------
 def fetch_new_articles() -> list[dict]:
     """
@@ -116,6 +142,7 @@ def fetch_new_articles() -> list[dict]:
 
     for feed_cfg in RSS_FEEDS:
         url = feed_cfg["url"]
+        # catatan: di config.py, pastikan pakai key "user_id" kalau mau mention user
         user_id = feed_cfg.get("user_id")
 
         try:
@@ -187,7 +214,6 @@ def build_discord_message(article: dict) -> str:
 # Setup Bot Discord
 # -------------------------------------------------------
 intents = discord.Intents.default()
-# Bot cuma perlu bisa melihat guild + pesan untuk mengirim
 intents.guilds = True
 intents.messages = True
 
@@ -196,7 +222,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 @bot.event
 async def on_ready():
-    logging.info("Bot login sebagai %s (ID: %s)", bot.user, bot.user.id)
+    logging.info("Bot login sebagai %s (ID: %s), versi %s", bot.user, bot.user.id, __version__)
     if not poll_feeds.is_running():
         poll_feeds.start()
         logging.info("Task poll_feeds dimulai.")
@@ -214,7 +240,10 @@ async def poll_feeds():
         logging.error("Channel dengan ID %s tidak ditemukan.", CHANNEL_ID)
         return
 
-    new_articles = fetch_new_articles()
+    # Jalankan fetch_new_articles di thread terpisah
+    logging.info("Memulai fetch_new_articles() di background thread...")
+    new_articles = await asyncio.to_thread(fetch_new_articles)
+    logging.info("Selesai fetch_new_articles(), ditemukan %d artikel kandidat.", len(new_articles))
 
     if not new_articles:
         logging.info("Tidak ada artikel baru.")
@@ -241,3 +270,4 @@ if __name__ == "__main__":
         logging.info("Bot dimatikan oleh user.")
     finally:
         conn.close()
+        logging.info("Koneksi DB ditutup.")
