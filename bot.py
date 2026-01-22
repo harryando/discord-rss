@@ -1,10 +1,11 @@
-# Discord RSS V1.1
+# Discord RSS V1.2
 
 import asyncio
 import threading
 import logging
 import sqlite3
 import os
+import re
 from datetime import datetime, timedelta, timezone
 from logging.handlers import TimedRotatingFileHandler
 
@@ -14,7 +15,7 @@ import feedparser
 
 from config import TOKEN, CHANNEL_ID, UPDATE_INTERVAL, LAST_ARTICLE_RANGE, RSS_FEEDS
 
-__version__ = "1.1"
+__version__ = "1.2"
 
 KEYWORDS = [
     "akuisisi",
@@ -33,20 +34,15 @@ KEYWORDS = [
 LOG_DIR = "logs"
 os.makedirs(LOG_DIR, exist_ok=True)
 
-# File dasar log (akan di-rotate harian)
-# Rotated file akan menjadi: logs/logs_19-11-2025.txt, logs/logs_20-11-2025.txt, dst.
 log_base_path = os.path.join(LOG_DIR, "logs")
 
 file_handler = TimedRotatingFileHandler(
     log_base_path,
     when="midnight",
     interval=1,
-    backupCount=30,      # simpan 30 hari log, bisa diubah
+    backupCount=30,
     encoding="utf-8",
 )
-
-# Format nama file setelah di-rotate:
-# logs/logs_19-11-2025.txt
 file_handler.suffix = "_%d-%m-%Y.txt"
 
 console_handler = logging.StreamHandler()
@@ -58,16 +54,14 @@ logging.basicConfig(
 )
 
 # -------------------------------------------------------
-# Database SQLite untuk menyimpan artikel yang sudah dikirim
+# Database SQLite
 # -------------------------------------------------------
 DB_PATH = "articles.db"
 
-# check_same_thread=False agar bisa dipakai dari thread lain (to_thread)
 conn = sqlite3.connect(DB_PATH, check_same_thread=False)
 cur = conn.cursor()
 DB_LOCK = threading.Lock()
 
-# Simpan link sebagai PRIMARY KEY supaya tidak ada duplikat
 cur.execute(
     """
     CREATE TABLE IF NOT EXISTS articles (
@@ -79,13 +73,11 @@ cur.execute(
 conn.commit()
 
 def article_already_sent(link: str) -> bool:
-    """Cek apakah link artikel sudah pernah disimpan di DB."""
     with DB_LOCK:
         cur.execute("SELECT 1 FROM articles WHERE link = ?", (link,))
         return cur.fetchone() is not None
 
 def save_article(link: str, title: str) -> None:
-    """Simpan artikel ke DB setelah pesan sukses dikirim."""
     try:
         with DB_LOCK:
             cur.execute(
@@ -96,21 +88,26 @@ def save_article(link: str, title: str) -> None:
     except Exception as e:
         logging.error("Gagal menyimpan artikel ke DB: %s", e)
 
+# -------------------------------------------------------
+# Keyword filter
+# -------------------------------------------------------
 def title_has_keyword(title: str) -> bool:
-    """Cek apakah judul mengandung salah satu keyword."""
     lower_title = title.lower()
-    return any(keyword in lower_title for keyword in KEYWORDS)
 
+    for keyword in KEYWORDS:
+        if " " in keyword:
+            if keyword in lower_title:
+                return True
+        else:
+            pattern = rf"\b{re.escape(keyword)}\b"
+            if re.search(pattern, title, re.IGNORECASE):
+                return True
+    return False
 
 # -------------------------------------------------------
-# Fungsi bantu untuk parsing tanggal dari RSS
+# RSS date parser
 # -------------------------------------------------------
 def get_entry_datetime(entry) -> datetime | None:
-    """
-    Ambil datetime artikel dalam timezone UTC.
-    Coba pakai published_parsed kalau ada,
-    kalau tidak ada ya kembalikan None (anggap tanpa batas tanggal).
-    """
     if hasattr(entry, "published_parsed") and entry.published_parsed:
         return datetime(*entry.published_parsed[:6], tzinfo=timezone.utc)
 
@@ -125,30 +122,51 @@ def get_entry_datetime(entry) -> datetime | None:
 
     return None
 
+# -------------------------------------------------------
+# OPSI 1 + OPSI 2: Safe RSS parser
+# -------------------------------------------------------
+def safe_parse_feed(url: str, retries: int = 3):
+    for attempt in range(1, retries + 1):
+        try:
+            feed = feedparser.parse(url)
+
+            if not feed.bozo:
+                return feed
+
+            logging.warning(
+                "RSS error (%s) attempt %d/%d: %s",
+                url,
+                attempt,
+                retries,
+                feed.bozo_exception,
+            )
+
+        except Exception as e:
+            logging.warning(
+                "Exception parse RSS (%s) attempt %d/%d: %s",
+                url,
+                attempt,
+                retries,
+                e,
+            )
+
+    logging.error("RSS %s gagal setelah %d percobaan, dilewati.", url, retries)
+    return None
 
 # -------------------------------------------------------
-# Ambil artikel baru dari semua RSS_FEEDS
+# Fetch articles
 # -------------------------------------------------------
 def fetch_new_articles() -> list[dict]:
-    """
-    Loop semua RSS_FEEDS, ambil entry baru yang:
-    - belum ada di DB
-    - tanggalnya masih dalam range LAST_ARTICLE_RANGE (kalau bisa ditentukan)
-    Return: list dict berisi info artikel + user_id + feed_title.
-    """
     result: list[dict] = []
     now = datetime.now(timezone.utc)
     max_age = timedelta(days=LAST_ARTICLE_RANGE)
 
     for feed_cfg in RSS_FEEDS:
         url = feed_cfg["url"]
-        # catatan: di config.py, pastikan pakai key "user_id" kalau mau mention user
-        user_id = feed_cfg.get("user_id")
+        user_id = feed_cfg.get("user")  # pastikan key sesuai config.py
 
-        try:
-            parsed_feed = feedparser.parse(url)
-        except Exception as e:
-            logging.error("Gagal parse RSS %s: %s", url, e)
+        parsed_feed = safe_parse_feed(url)
+        if not parsed_feed:
             continue
 
         feed_title = getattr(parsed_feed.feed, "title", "RSS Feed")
@@ -160,20 +178,15 @@ def fetch_new_articles() -> list[dict]:
             if not link:
                 continue
 
-            # Sudah pernah dikirim?
             if article_already_sent(link):
                 continue
 
-            # Filter berdasarkan keyword judul
             if not title_has_keyword(title):
                 continue
 
-            # Cek umur artikel (kalau bisa di-parse)
             pub_dt = get_entry_datetime(entry)
-            if pub_dt is not None:
-                if now - pub_dt > max_age:
-                    # Artikel terlalu lama, lewati
-                    continue
+            if pub_dt and now - pub_dt > max_age:
+                continue
 
             result.append(
                 {
@@ -186,50 +199,42 @@ def fetch_new_articles() -> list[dict]:
 
     return result
 
-
 # -------------------------------------------------------
-# Format pesan Discord
+# Discord message formatter
 # -------------------------------------------------------
 def build_discord_message(article: dict) -> str:
-    """
-    Template:
-    **Judul Artikel** oleh <@user_id> / Nama Feed
-    link
-    """
     title = article["title"]
     link = article["link"]
     feed_title = article["feed_title"]
     user_id = article["user_id"]
 
-    if user_id:
-        author_part = f"<@{user_id}>"
-    else:
-        author_part = feed_title
-
-    message = f"**{title}** oleh {author_part}\n{link}"
-    return message
-
+    author_part = f"<@{user_id}>" if user_id else feed_title
+    return f"**{title}** oleh {author_part}\n{link}"
 
 # -------------------------------------------------------
-# Setup Bot Discord
+# Discord bot setup
 # -------------------------------------------------------
 intents = discord.Intents.default()
 intents.guilds = True
 intents.messages = True
+intents.message_content = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-
 @bot.event
 async def on_ready():
-    logging.info("Bot login sebagai %s (ID: %s), versi %s", bot.user, bot.user.id, __version__)
+    logging.info(
+        "Bot login sebagai %s (ID: %s), versi %s",
+        bot.user,
+        bot.user.id,
+        __version__,
+    )
     if not poll_feeds.is_running():
         poll_feeds.start()
         logging.info("Task poll_feeds dimulai.")
 
-
 # -------------------------------------------------------
-# Task loop cek RSS berkala
+# RSS polling task
 # -------------------------------------------------------
 @tasks.loop(minutes=UPDATE_INTERVAL)
 async def poll_feeds():
@@ -240,25 +245,20 @@ async def poll_feeds():
         logging.error("Channel dengan ID %s tidak ditemukan.", CHANNEL_ID)
         return
 
-    # Jalankan fetch_new_articles di thread terpisah
     logging.info("Memulai fetch_new_articles() di background thread...")
     new_articles = await asyncio.to_thread(fetch_new_articles)
-    logging.info("Selesai fetch_new_articles(), ditemukan %d artikel kandidat.", len(new_articles))
+    logging.info("Selesai fetch_new_articles(), %d artikel kandidat.", len(new_articles))
 
     if not new_articles:
         logging.info("Tidak ada artikel baru.")
         return
 
-    logging.info("Ditemukan %d artikel baru.", len(new_articles))
-
     for art in new_articles:
-        msg = build_discord_message(art)
         try:
-            await channel.send(msg)
+            await channel.send(build_discord_message(art))
             save_article(art["link"], art["title"])
         except Exception as e:
             logging.error("Gagal mengirim pesan ke Discord: %s", e)
-
 
 # -------------------------------------------------------
 # Entry point
