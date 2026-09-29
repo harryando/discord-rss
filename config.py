@@ -1,8 +1,8 @@
 # Bot Token
-TOKEN = "MTQzNzI4NDI5NTQ2NjAyOTI2OA.Gj3uAo.aRm8kBqRULEywbHex27S9z4FE5k9jGAgTrMBO4"
+TOKEN = "your_discord_token"
 
 # Channel ID
-CHANNEL_ID = 1387987690062086234
+CHANNEL_ID = [your_channel_id]
 
 # Update interval for how often the bot is supposed to check if a new entry in the RSS feed exists (in Minutes)
 UPDATE_INTERVAL = 10
